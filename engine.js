@@ -1,604 +1,344 @@
 const canvas = document.getElementById("gameCanvas");
 const ctx = canvas.getContext("2d");
+const socket = new WebSocket("ws://localhost:3000");
 
-// --- SESSION PERSISTENCE (Using sessionStorage) ---
-let myId = sessionStorage.getItem("arena_playerId");
-let myColor = sessionStorage.getItem("arena_playerColor");
-let myName = sessionStorage.getItem("arena_playerName");
+// UI Elements
+const loginOverlay = document.getElementById("login-overlay");
+const votingOverlay = document.getElementById("voting-overlay");
+const messageOverlay = document.getElementById("message-overlay");
+const spectatorHud = document.getElementById("spectator-hud");
+const hud = document.getElementById("hud");
 
-// If the player doesn't have a saved ID in this session, generate new ones
-if (!myId) {
-  myId = Math.random().toString(36).substring(2, 9);
-  myColor = `hsl(${Math.floor(Math.random() * 360)}, 100%, 50%)`;
-
-  sessionStorage.setItem("arena_playerId", myId);
-  sessionStorage.setItem("arena_playerColor", myColor);
-}
-
-// Grab UI Elements
-const nameOverlay = document.getElementById("name-overlay");
-const nameInput = document.getElementById("player-name-input");
-const nameError = document.getElementById("name-error");
-const joinBtn = document.getElementById("join-btn");
-
-let socket = null; // Declare socket globally so inputs can use it
-
-if (myName) {
-  // If they already have a name in this tab (e.g., they just refreshed), connect immediately
-  nameOverlay.style.display = "none";
-  connectToServer();
-} else {
-  // If it's a completely new tab/connection, show the overlay
-  nameOverlay.style.display = "flex";
-  nameInput.value = "";
-  nameInput.focus();
-}
-
-// Handle the Join Button Click
-joinBtn.addEventListener("click", () => {
-  const enteredName = nameInput.value.trim().toUpperCase();
-
-  if (enteredName === "") {
-    // Show red error if empty
-    nameError.style.opacity = "1";
-  } else {
-    // Hide error, save name to the current session, hide UI, and connect
-    nameError.style.opacity = "0";
-    myName = enteredName;
-    sessionStorage.setItem("arena_playerName", myName);
-    nameOverlay.style.display = "none";
-    connectToServer();
-  }
-});
-
-// Allow hitting "Enter" to join
-nameInput.addEventListener("keypress", (e) => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    joinBtn.click();
-  }
-});
-
-function connectToServer() {
-  socket = new WebSocket("ws://localhost:3000");
-
-  // When we connect, perform a handshake with the server
-  socket.addEventListener("open", () => {
-    socket.send(
-      JSON.stringify({ type: "JOIN", id: myId, color: myColor, name: myName }),
-    );
-  });
-
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-
-    // 1. Check for Lobby Rejection
-    if (message.type === "LOBBY_FULL") {
-      document.getElementById("full-screen-overlay").style.display = "flex";
-      return;
-    }
-
-    if (message.type === "INIT") {
-      myId = message.id;
-    } else if (message.type === "STATE_UPDATE") {
-      const newPlayers = message.state.players;
-
-      // Detect state changes to trigger visual/audio effects
-      for (const id in newPlayers) {
-        const newP = newPlayers[id];
-        const oldP = serverPlayers[id];
-
-        if (oldP) {
-          // 1. Damage Taken
-          if (newP.health < oldP.health) {
-            spawnParticles(oldP.x, oldP.y, "#ff3333", 8, false);
-            SoundEngine.playHit();
-
-            if (id === myId) {
-              shakeIntensity = 12;
-            }
-          }
-
-          // 2. Player Death
-          if (newP.health > oldP.health && oldP.health <= 25) {
-            spawnParticles(oldP.x, oldP.y, oldP.color, 35, true);
-            spawnParticles(oldP.x, oldP.y, "#ffff00", 15, true);
-            SoundEngine.playExplosion();
-          }
-
-          // 3. Powerup Pickup
-          if (newP.boostTimer > 0 && oldP.boostTimer === 0) {
-            SoundEngine.playPickup();
-          }
-        }
-      }
-
-      matchStatus = message.state.status;
-      matchWinner = message.state.winner;
-      intermissionTimer = message.state.intermissionTimer;
-
-      serverPlayers = newPlayers;
-      serverProjectiles = message.state.projectiles;
-      serverTurrets = message.state.turrets;
-      serverBoosters = message.state.boosters;
-      serverWalls = message.state.walls;
-
-      updateUI();
-    }
-  });
-}
-
-// Match State Variables
-let matchStatus = "PLAYING";
-let matchWinner = null;
-let intermissionTimer = 0;
-
-let serverPlayers = {};
+let myId = null;
+let gameState = null;
 let renderPlayers = {};
-let serverProjectiles = {};
-let serverTurrets = {};
-let serverBoosters = {};
-let serverWalls = [];
+let keys = { w: false, a: false, s: false, d: false };
 
-const LERP_FACTOR = 0.3;
-
-// --- VISUAL JUICE VARIABLES ---
-let shakeIntensity = 0;
-const particles = [];
-let lastFrameTime = performance.now();
-
-// --- SOUND ENGINE (WEB AUDIO API) ---
-let audioCtx = null;
-
-function initAudio() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function getRandomColor() {
+  const letters = "0123456789ABCDEF";
+  let color = "#";
+  for (let i = 0; i < 6; i++) {
+    color += letters[Math.floor(Math.random() * 16)];
   }
-  if (audioCtx.state === "suspended") {
-    audioCtx.resume();
-  }
+  return color;
+}
+document.getElementById("player-color").value = getRandomColor();
+
+let sessionId = sessionStorage.getItem("arena_session_id");
+if (!sessionId) {
+  sessionId = Math.random().toString(36).substring(2, 15);
+  sessionStorage.setItem("arena_session_id", sessionId);
 }
 
-const SoundEngine = {
-  playShoot: () => {
-    if (!audioCtx) return;
-    const osc = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-    osc.type = "square";
-    osc.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
+document.getElementById("join-btn").addEventListener("click", () => {
+  const name = document.getElementById("player-name").value || "Player";
+  const color = document.getElementById("player-color").value;
 
-    osc.frequency.setValueAtTime(600, audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.1);
-
-    gainNode.gain.setValueAtTime(0.05, audioCtx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(
-      0.001,
-      audioCtx.currentTime + 0.1,
-    );
-
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.1);
-  },
-
-  playHit: () => {
-    if (!audioCtx) return;
-    const osc = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-    osc.type = "sawtooth";
-    osc.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
-
-    osc.frequency.setValueAtTime(150, audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.1);
-
-    gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(
-      0.001,
-      audioCtx.currentTime + 0.1,
-    );
-
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.1);
-  },
-
-  playExplosion: () => {
-    if (!audioCtx) return;
-    const osc = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-    osc.type = "sawtooth";
-    osc.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
-
-    osc.frequency.setValueAtTime(100, audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(10, audioCtx.currentTime + 0.4);
-
-    gainNode.gain.setValueAtTime(0.2, audioCtx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(
-      0.001,
-      audioCtx.currentTime + 0.4,
-    );
-
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.4);
-  },
-
-  playPickup: () => {
-    if (!audioCtx) return;
-    const osc = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-    osc.type = "sine";
-    osc.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
-
-    osc.frequency.setValueAtTime(400, audioCtx.currentTime);
-    osc.frequency.setValueAtTime(600, audioCtx.currentTime + 0.1);
-    osc.frequency.setValueAtTime(800, audioCtx.currentTime + 0.2);
-
-    gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
-    gainNode.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.3);
-
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.3);
-  },
-};
-
-function spawnParticles(x, y, color, count, isExplosion = false) {
-  for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = isExplosion
-      ? 120 + Math.random() * 280
-      : 40 + Math.random() * 120;
-    particles.push({
-      x: x,
-      y: y,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed,
+  socket.send(
+    JSON.stringify({
+      type: "JOIN",
+      id: sessionId,
+      name: name,
       color: color,
-      size: isExplosion ? 3 + Math.random() * 5 : 2 + Math.random() * 3,
-      life: isExplosion
-        ? 0.4 + Math.random() * 0.3
-        : 0.15 + Math.random() * 0.2,
-      maxLife: isExplosion ? 0.7 : 0.35,
-    });
-  }
-}
-
-function updateUI() {
-  const scoreList = document.getElementById("score-list");
-  const turretStatus = document.getElementById("turret-status");
-
-  if (!scoreList || !turretStatus) return;
-
-  if (serverPlayers[myId]) {
-    const me = serverPlayers[myId];
-    if (me.score >= 3) {
-      turretStatus.style.color = "#00FF00";
-      turretStatus.innerText = "TURRET READY (E)";
-    } else {
-      turretStatus.style.color = "rgba(255, 255, 255, 0.7)";
-      turretStatus.innerText = `Turret: ${me.score}/3 Kills`;
-    }
-  }
-
-  const sortedPlayers = Object.entries(serverPlayers).sort(
-    (a, b) => b[1].score - a[1].score,
+    }),
   );
 
-  let html = "";
-  for (const [id, player] of sortedPlayers) {
-    const isMe = id === myId;
-    const fontWeight = isMe ? "bold" : "normal";
-    const textAppend = isMe ? " (You)" : "";
+  loginOverlay.style.display = "none";
+});
 
-    html += `
-      <div class="player-row" style="font-weight: ${fontWeight};">
-        <div class="color-box" style="background-color: ${player.color};"></div>
-        <span>${player.name || "UNKNOWN"}${textAppend}: ${player.score} / 15 pts</span>
-      </div>
-    `;
+socket.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+
+  if (data.type === "INIT") {
+    myId = data.id;
+  } else if (
+    data.type === "KICKED" ||
+    data.type === "MATCH_IN_PROGRESS" ||
+    data.type === "LOBBY_FULL"
+  ) {
+    showMessage(
+      data.type.replace(/_/g, " "),
+      data.reason || "Please try again later.",
+    );
+  } else if (data.type === "STATE_UPDATE") {
+    gameState = data.state;
+    updateUI(gameState);
   }
-  scoreList.innerHTML = html;
+};
+
+let currentVote = null;
+
+function updateUI(state) {
+  if (state.status === "WAITING") {
+    votingOverlay.style.display = "none";
+    messageOverlay.style.display = "flex";
+    spectatorHud.style.display = "none";
+    hud.style.display = "none";
+    showMessage("WAITING FOR PLAYERS", "Need at least 2 players to start...");
+  } else if (state.status === "VOTING") {
+    votingOverlay.style.display = "flex";
+    messageOverlay.style.display = "none";
+    spectatorHud.style.display = "none";
+    hud.style.display = "none";
+
+    document.getElementById("vote-timer").innerText = Math.ceil(
+      state.voteTimer,
+    );
+    document.getElementById("ffa-count").innerText = state.votes.ffa;
+    document.getElementById("tourney-count").innerText = state.votes.tourney;
+  } else if (
+    state.status === "INTERMISSION" ||
+    state.status === "CELEBRATION"
+  ) {
+    votingOverlay.style.display = "none";
+    messageOverlay.style.display = "flex";
+    hud.style.display = "none";
+
+    if (state.status === "CELEBRATION" && state.winner) {
+      showMessage(
+        "🏆 TOURNAMENT CHAMPION 🏆",
+        `${state.winner.name} wins it all!`,
+      );
+    } else if (state.winner) {
+      showMessage("MATCH OVER", `${state.winner.name}`);
+    } else {
+      showMessage("INTERMISSION", "Preparing next match...");
+    }
+  } else {
+    votingOverlay.style.display = "none";
+    messageOverlay.style.display = "none";
+    hud.style.display = "block";
+
+    if (state.players[myId] && state.players[myId].isSpectator) {
+      spectatorHud.style.display = "block";
+      hud.style.display = "none";
+    } else {
+      spectatorHud.style.display = "none";
+    }
+
+    if (state.players[myId] && !state.players[myId].isSpectator) {
+      const p = state.players[myId];
+
+      const turretCost = state.currentMode === "TOURNAMENT" ? 1 : 3;
+      const tScore = p.turretScore || 0;
+      let turretText =
+        tScore >= turretCost
+          ? "<span style='color: #4caf50;'>READY (Press SPACE)</span>"
+          : `${tScore} / ${turretCost} Kills`;
+
+      let activeTurret = false;
+      for (let tId in state.turrets) {
+        if (state.turrets[tId].ownerId === myId) activeTurret = true;
+      }
+      if (activeTurret)
+        turretText = "<span style='color: #ff9800;'>DEPLOYED ACTIVE</span>";
+
+      // --- BUILD THE NEW TOURNAMENT LEADERBOARD ---
+      let tourneyStats = "";
+      if (state.currentMode === "TOURNAMENT" && state.tournament) {
+        tourneyStats = `<div style="margin-top: 15px; padding-top: 10px; border-top: 1px solid #555;">`;
+        tourneyStats += `<div style="margin-bottom: 8px; color: #ffeb3b;"><strong>Tournament Standings</strong></div>`;
+
+        // Sort players logically: Champions first, then Active, then Eliminated
+        const playersList = Object.values(state.tournament.players).sort(
+          (a, b) => {
+            const ranks = { Champion: 1, Active: 2, Eliminated: 3 };
+            return ranks[a.status] - ranks[b.status];
+          },
+        );
+
+        playersList.forEach((pData, index) => {
+          let color =
+            pData.status === "Active"
+              ? "#4caf50"
+              : pData.status === "Champion"
+                ? "#ffeb3b"
+                : "#ff4c4c";
+          let statusText =
+            pData.status === "Eliminated"
+              ? `(Eliminated)`
+              : `(Rank ${index + 1})`;
+          if (pData.status === "Champion") statusText = `🏆 WINNER`;
+          tourneyStats += `<div style="color: ${color}; font-size: 14px; margin-bottom: 4px;">${index + 1}. ${pData.name} ${statusText}</div>`;
+        });
+        tourneyStats += `</div>`;
+      }
+
+      const displayMode =
+        state.currentMode === "TOURNAMENT"
+          ? `TOURNAMENT (Match ${state.tournament.matchNumber})`
+          : "FREE FOR ALL";
+
+      hud.innerHTML = `
+                <div style="margin-bottom: 5px;">Health: ${p.health}</div>
+                <div style="margin-bottom: 5px;">Kills: ${p.score}</div>
+                <div style="margin-bottom: 5px; color: #00ffff;">Mode: ${displayMode}</div>
+                <div style="color: #aaa; margin-top: 10px; font-size: 14px;">Turret: ${turretText}</div>
+                ${tourneyStats}
+            `;
+    }
+  }
 }
 
-let isShooting = false;
-let aimX = 0;
-let aimY = 0;
-let lastShotTime = 0;
-const FIRE_RATE_MS = 200;
-
-// Update aiming coordinates on mouse move
-canvas.addEventListener("mousemove", (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  aimX = (e.clientX - rect.left) * scaleX;
-  aimY = (e.clientY - rect.top) * scaleY;
-});
-
-canvas.addEventListener("mousedown", (e) => {
-  initAudio();
-  if (e.button === 0) isShooting = true;
-});
-
-window.addEventListener("mouseup", (e) => {
-  if (e.button === 0) isShooting = false;
-});
-
-const keys = { w: false, a: false, s: false, d: false };
-
-function sendInput() {
-  if (matchStatus !== "PLAYING") return;
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "INPUT", keys: keys }));
-  }
+function showMessage(title, subtitle) {
+  messageOverlay.style.display = "flex";
+  document.getElementById("message-title").innerText = title;
+  document.getElementById("message-subtitle").innerText = subtitle;
 }
+
+document.getElementById("vote-ffa").addEventListener("click", () => {
+  if (currentVote || gameState.status !== "VOTING") return;
+  currentVote = "FFA";
+  document.getElementById("vote-ffa").classList.add("selected");
+  socket.send(JSON.stringify({ type: "VOTE", choice: "FFA" }));
+});
+
+document.getElementById("vote-tourney").addEventListener("click", () => {
+  if (currentVote || gameState.status !== "VOTING") return;
+  currentVote = "TOURNAMENT";
+  document.getElementById("vote-tourney").classList.add("selected");
+  socket.send(JSON.stringify({ type: "VOTE", choice: "TOURNAMENT" }));
+});
+
+setInterval(() => {
+  if (gameState && gameState.status !== "VOTING" && currentVote) {
+    currentVote = null;
+    document.getElementById("vote-ffa").classList.remove("selected");
+    document.getElementById("vote-tourney").classList.remove("selected");
+  }
+}, 1000);
 
 window.addEventListener("keydown", (e) => {
-  initAudio();
-  // Prevent sending game inputs if typing in the name box or if game is paused
-  if (document.activeElement === nameInput || matchStatus !== "PLAYING") return;
-
-  const key = e.key.toLowerCase();
-
-  if (key === " ") {
-    e.preventDefault();
-    isShooting = true;
-  }
-
-  if (keys.hasOwnProperty(key) && !keys[key]) {
-    keys[key] = true;
+  if (keys.hasOwnProperty(e.key.toLowerCase())) {
+    keys[e.key.toLowerCase()] = true;
     sendInput();
   }
-
-  if (key === "e" && socket && socket.readyState === WebSocket.OPEN) {
+  if (e.code === "Space") {
+    e.preventDefault();
     socket.send(JSON.stringify({ type: "DROP_TURRET" }));
   }
 });
 
 window.addEventListener("keyup", (e) => {
-  if (document.activeElement === nameInput) return;
-  const key = e.key.toLowerCase();
-
-  if (key === " ") {
-    isShooting = false;
-  }
-
-  if (keys.hasOwnProperty(key)) {
-    keys[key] = false;
+  if (keys.hasOwnProperty(e.key.toLowerCase())) {
+    keys[e.key.toLowerCase()] = false;
     sendInput();
   }
 });
 
-function gameLoop() {
-  const now = performance.now();
-  const dt = (now - lastFrameTime) / 1000;
-  lastFrameTime = now;
+function sendInput() {
+  if (
+    !myId ||
+    !gameState ||
+    gameState.status === "VOTING" ||
+    gameState.status === "INTERMISSION" ||
+    gameState.status === "WAITING"
+  )
+    return;
+  if (gameState.players[myId] && gameState.players[myId].isSpectator) return;
+  socket.send(JSON.stringify({ type: "INPUT", keys }));
+}
 
+canvas.addEventListener("mousedown", (e) => {
+  if (
+    !myId ||
+    !gameState ||
+    gameState.status === "VOTING" ||
+    gameState.status === "INTERMISSION" ||
+    gameState.status === "WAITING"
+  )
+    return;
+  if (gameState.players[myId] && gameState.players[myId].isSpectator) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+
+  const targetX = (e.clientX - rect.left) * scaleX;
+  const targetY = (e.clientY - rect.top) * scaleY;
+
+  socket.send(JSON.stringify({ type: "SHOOT", targetX, targetY }));
+});
+
+const lerp = (start, end, factor) => start + (end - start) * factor;
+
+function drawGame(state) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  ctx.save();
-  if (shakeIntensity > 0) {
-    const shakeX = (Math.random() - 0.5) * shakeIntensity;
-    const shakeY = (Math.random() - 0.5) * shakeIntensity;
-    ctx.translate(shakeX, shakeY);
+  ctx.fillStyle = "#555";
+  state.walls.forEach((w) => ctx.fillRect(w.x, w.y, w.w, w.h));
 
-    shakeIntensity *= 0.85;
-    if (shakeIntensity < 0.2) shakeIntensity = 0;
-  }
-
-  // 1. Draw Walls
-  ctx.fillStyle = "#4a4a4a";
-  for (const wall of serverWalls) {
-    ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
-  }
-
-  // 2. Draw Boosters
-  for (const bId in serverBoosters) {
-    const booster = serverBoosters[bId];
-    ctx.save();
-    ctx.translate(booster.x, booster.y);
-    ctx.rotate(Math.PI / 4);
-
-    ctx.shadowBlur = 15;
-    ctx.shadowColor = "#00FFFF";
-    ctx.fillStyle = "#00FFFF";
-    ctx.fillRect(
-      -booster.size / 2,
-      -booster.size / 2,
-      booster.size,
-      booster.size,
-    );
-    ctx.restore();
-  }
-
-  // 3. Draw Turrets
-  for (const tId in serverTurrets) {
-    const turret = serverTurrets[tId];
+  ctx.fillStyle = "#00ffff";
+  for (const bId in state.boosters) {
+    const b = state.boosters[bId];
     ctx.beginPath();
-    ctx.arc(turret.x, turret.y, turret.range, 0, Math.PI * 2);
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.1)";
-    ctx.stroke();
-
-    ctx.fillStyle = turret.color;
-    ctx.beginPath();
-    ctx.arc(turret.x, turret.y, 12, 0, Math.PI * 2);
+    ctx.arc(b.x, b.y, b.size / 2, 0, Math.PI * 2);
     ctx.fill();
-    ctx.strokeStyle = "white";
-    ctx.lineWidth = 2;
+  }
+
+  for (const tId in state.turrets) {
+    const t = state.turrets[tId];
+    ctx.fillStyle = t.color;
+    ctx.fillRect(t.x - 10, t.y - 10, 20, 20);
+    ctx.strokeStyle = `rgba(255, 255, 255, 0.4)`;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, t.range, 0, Math.PI * 2);
     ctx.stroke();
   }
 
-  // 4. Draw Projectiles
+  for (const id in renderPlayers) {
+    if (!state.players[id]) delete renderPlayers[id];
+  }
+
+  for (const pId in state.players) {
+    const p = state.players[pId];
+
+    if (!renderPlayers[pId]) {
+      renderPlayers[pId] = { x: p.x, y: p.y };
+    } else {
+      renderPlayers[pId].x = lerp(renderPlayers[pId].x, p.x, 0.3);
+      renderPlayers[pId].y = lerp(renderPlayers[pId].y, p.y, 0.3);
+    }
+
+    const rx = renderPlayers[pId].x;
+    const ry = renderPlayers[pId].y;
+
+    ctx.globalAlpha = p.isSpectator ? 0.3 : 1.0;
+
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(rx, ry, p.size / 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "white";
+    ctx.font = "12px Arial";
+    ctx.textAlign = "center";
+    ctx.fillText(p.name, rx, ry - 15);
+
+    if (!p.isSpectator) {
+      ctx.fillStyle = "red";
+      ctx.fillRect(rx - 15, ry + 15, 30, 4);
+      ctx.fillStyle = "#00ff00";
+      ctx.fillRect(rx - 15, ry + 15, 30 * (p.health / 100), 4);
+    }
+    ctx.globalAlpha = 1.0;
+  }
+
   ctx.fillStyle = "yellow";
-  for (const pId in serverProjectiles) {
-    const bullet = serverProjectiles[pId];
+  for (const pId in state.projectiles) {
+    const bullet = state.projectiles[pId];
     ctx.beginPath();
     ctx.arc(bullet.x, bullet.y, 4, 0, Math.PI * 2);
     ctx.fill();
   }
+}
 
-  // 5. Draw Players
-  for (const id in serverPlayers) {
-    const target = serverPlayers[id];
-
-    if (!renderPlayers[id]) {
-      renderPlayers[id] = {
-        x: target.x,
-        y: target.y,
-        size: target.size,
-        color: target.color,
-      };
-    }
-
-    const renderObj = renderPlayers[id];
-
-    if (matchStatus === "PLAYING") {
-      renderObj.x += (target.x - renderObj.x) * LERP_FACTOR;
-      renderObj.y += (target.y - renderObj.y) * LERP_FACTOR;
-    }
-
-    if (target.boostTimer > 0) {
-      ctx.shadowBlur = 10;
-      ctx.shadowColor = "#00FFFF";
-    } else {
-      ctx.shadowBlur = 0;
-    }
-
-    ctx.fillStyle = renderObj.color;
-    ctx.fillRect(
-      renderObj.x - renderObj.size / 2,
-      renderObj.y - renderObj.size / 2,
-      renderObj.size,
-      renderObj.size,
-    );
-
-    ctx.shadowBlur = 0;
-
-    if (id === myId) {
-      ctx.strokeStyle = "white";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(
-        renderObj.x - renderObj.size / 2,
-        renderObj.y - renderObj.size / 2,
-        renderObj.size,
-        renderObj.size,
-      );
-    }
-
-    // DRAW NAME BELOW PLAYER
-    ctx.fillStyle = "white";
-    ctx.font = "12px monospace";
-    ctx.textAlign = "center";
-    ctx.fillText(
-      target.name || "UNKNOWN",
-      renderObj.x,
-      renderObj.y + renderObj.size / 2 + 15,
-    );
-
-    if (target.boostTimer > 0) {
-      ctx.fillStyle = "#00FFFF";
-      ctx.font = "bold 12px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText(
-        target.boostTimer.toFixed(1) + "s",
-        renderObj.x,
-        renderObj.y - 28,
-      );
-    }
-
-    ctx.fillStyle = "red";
-    ctx.fillRect(
-      renderObj.x - renderObj.size / 2,
-      renderObj.y - 22,
-      renderObj.size,
-      4,
-    );
-
-    ctx.fillStyle = "green";
-    ctx.fillRect(
-      renderObj.x - renderObj.size / 2,
-      renderObj.y - 22,
-      renderObj.size * (target.health / 100),
-      4,
-    );
-  }
-
-  // Cleanup disconnected players
-  for (const id in renderPlayers) {
-    if (!serverPlayers[id]) delete renderPlayers[id];
-  }
-
-  // 6. --- RENDER PARTICLES ---
-  for (let i = particles.length - 1; i >= 0; i--) {
-    const p = particles[i];
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.life -= dt;
-
-    if (p.life <= 0) {
-      particles.splice(i, 1);
-      continue;
-    }
-
-    ctx.fillStyle = p.color;
-    ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
-    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
-  }
-  ctx.globalAlpha = 1.0;
-
-  ctx.restore();
-
-  // Auto-fire loop
-  if (
-    isShooting &&
-    matchStatus === "PLAYING" &&
-    socket &&
-    socket.readyState === WebSocket.OPEN &&
-    nameOverlay.style.display === "none" // Don't shoot while name overlay is open
-  ) {
-    const nowMs = Date.now();
-    if (nowMs - lastShotTime > FIRE_RATE_MS) {
-      socket.send(
-        JSON.stringify({ type: "SHOOT", targetX: aimX, targetY: aimY }),
-      );
-      SoundEngine.playShoot();
-      lastShotTime = nowMs;
-    }
-  }
-
-  // 7. Draw Intermission Overlay
-  if (matchStatus === "INTERMISSION") {
-    ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    if (matchWinner) {
-      const isMe = matchWinner.id === myId;
-      const titleText = isMe ? "VICTORY!" : "MATCH OVER";
-      const subText = isMe
-        ? "You reached 15 kills."
-        : "An opponent has reached 15 kills.";
-
-      ctx.fillStyle = matchWinner.color;
-      ctx.font = "bold 56px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText(titleText, canvas.width / 2, canvas.height / 2 - 20);
-
-      ctx.fillStyle = "white";
-      ctx.font = "24px Arial";
-      ctx.fillText(subText, canvas.width / 2, canvas.height / 2 + 25);
-    }
-
-    ctx.fillStyle = "#aaaaaa";
-    ctx.font = "20px Arial";
-    ctx.fillText(
-      `Next match starting in ${Math.ceil(intermissionTimer)}...`,
-      canvas.width / 2,
-      canvas.height / 2 + 70,
-    );
-  }
-
+function gameLoop() {
   requestAnimationFrame(gameLoop);
+
+  if (gameState) {
+    drawGame(gameState);
+  }
 }
 
 requestAnimationFrame(gameLoop);

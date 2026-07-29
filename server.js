@@ -4,15 +4,13 @@ const wss = new WebSocket.Server({ port: 3000 });
 // Procedural map generation
 function generateRandomMap() {
   const walls = [];
-  const numWalls = 4 + Math.floor(Math.random() * 4); // 4 to 7 walls
+  const numWalls = 4 + Math.floor(Math.random() * 4);
 
   for (let i = 0; i < numWalls; i++) {
-    // 50/50 chance for horizontal or vertical wall
     const isVertical = Math.random() > 0.5;
     const w = isVertical ? 40 : 100 + Math.random() * 200;
     const h = isVertical ? 100 + Math.random() * 200 : 40;
 
-    // Keep walls away from the absolute edges to prevent spawn trapping
     const x = 50 + Math.random() * (800 - w - 100);
     const y = 50 + Math.random() * (600 - h - 100);
 
@@ -21,10 +19,18 @@ function generateRandomMap() {
   return walls;
 }
 
+// Global Game State
 const gameState = {
-  status: "PLAYING",
+  status: "WAITING",
+  currentMode: null,
   winner: null,
   intermissionTimer: 0,
+  voteTimer: 15.0,
+  votes: { ffa: 0, tourney: 0 },
+  votedPlayers: {},
+  tournamentBracket: [],
+  activeFighters: [],
+  tournament: null,
   players: {},
   projectiles: {},
   walls: generateRandomMap(),
@@ -32,19 +38,16 @@ const gameState = {
   boosters: {},
 };
 
-// Temporary memory for players who disconnect or refresh
 const recentDisconnects = {};
-
 let projectileIdCounter = 0;
 let boosterIdCounter = 0;
-
-// NEW: Booster timers for the single-booster cycle
 let boosterSpawnTimer = null;
 let boosterDespawnTimer = null;
 
-const TICK_RATE = 30;
+const TICK_RATE = 60;
 const TURRET_COST = 3;
-const WIN_SCORE = 15;
+const FFA_WIN_SCORE = 15;
+const TOURNAMENT_WIN_SCORE = 3;
 
 function getValidSpawnPoint() {
   const MAX_ATTEMPTS = 50;
@@ -70,6 +73,7 @@ function getValidSpawnPoint() {
     if (!isSafe) continue;
 
     for (const pId in gameState.players) {
+      if (gameState.players[pId].isSpectator) continue;
       const other = gameState.players[pId];
       const dx = other.x - testX;
       const dy = other.y - testY;
@@ -85,81 +89,187 @@ function getValidSpawnPoint() {
   return { x: 400, y: 50 };
 }
 
-// NEW: Automated Booster Cycle
 function scheduleBooster() {
   clearTimeout(boosterSpawnTimer);
   clearTimeout(boosterDespawnTimer);
-
-  // Clear any existing boosters just in case
   gameState.boosters = {};
 
-  // 1. Wait 20 seconds, then spawn a booster
   boosterSpawnTimer = setTimeout(() => {
     const pos = getValidSpawnPoint();
-    gameState.boosters[boosterIdCounter++] = {
-      x: pos.x,
-      y: pos.y,
-      size: 16,
-    };
-    console.log("Booster spawned!");
+    gameState.boosters[boosterIdCounter++] = { x: pos.x, y: pos.y, size: 16 };
 
-    // 2. If it sits there for 10 seconds uncollected, make it disappear
     boosterDespawnTimer = setTimeout(() => {
       gameState.boosters = {};
-      console.log("Booster despawned. Scheduling next one...");
-      scheduleBooster(); // Restart the cycle
-    }, 10000); // 10 seconds lifespan
-  }, 20000); // 20 seconds between spawns
+      scheduleBooster();
+    }, 10000);
+  }, 20000);
 }
 
-// Start the first booster cycle
-scheduleBooster();
+// --- GAME MODE CONTROLLERS ---
 
-function resetMatch() {
-  gameState.status = "PLAYING";
+function startWaitingPhase() {
+  gameState.status = "WAITING";
+  gameState.currentMode = null;
+  gameState.winner = null;
+  gameState.voteTimer = 15.0;
+  gameState.votes = { ffa: 0, tourney: 0 };
+  gameState.votedPlayers = {};
+  gameState.activeFighters = [];
+  gameState.tournamentBracket = [];
+  gameState.tournament = null;
+  gameState.projectiles = {};
+  gameState.turrets = {};
+
+  for (const id in gameState.players) {
+    gameState.players[id].isSpectator = false;
+    gameState.players[id].health = 100;
+  }
+
+  clearTimeout(boosterSpawnTimer);
+  clearTimeout(boosterDespawnTimer);
+}
+
+function startVotingPhase() {
+  gameState.status = "VOTING";
+  gameState.currentMode = null;
+  gameState.voteTimer = 15.0;
+  gameState.votes = { ffa: 0, tourney: 0 };
+  gameState.votedPlayers = {};
   gameState.winner = null;
   gameState.projectiles = {};
   gameState.turrets = {};
-  gameState.boosters = {};
-  gameState.walls = generateRandomMap();
+  gameState.activeFighters = [];
+  clearTimeout(boosterSpawnTimer);
+  clearTimeout(boosterDespawnTimer);
 
-  scheduleBooster(); // Restart booster cycle for new match
+  for (const id in gameState.players) {
+    gameState.players[id].isSpectator = false;
+  }
+}
+
+function resolveVotingPhase() {
+  if (Object.keys(gameState.players).length < 2) {
+    startWaitingPhase();
+    return;
+  }
+
+  if (gameState.votes.tourney > gameState.votes.ffa) {
+    startTournament();
+  } else {
+    startFFA();
+  }
+}
+
+function startFFA() {
+  gameState.currentMode = "FFA";
+  gameState.status = "FFA";
+  gameState.walls = generateRandomMap();
+  scheduleBooster();
 
   for (const id in gameState.players) {
     const player = gameState.players[id];
     player.score = 0;
+    player.turretScore = 0;
     player.health = 100;
     player.boostTimer = 0;
+    player.isSpectator = false;
     const spawnPos = getValidSpawnPoint();
     player.x = spawnPos.x;
     player.y = spawnPos.y;
   }
 }
 
+function startTournament() {
+  gameState.currentMode = "TOURNAMENT";
+  gameState.status = "TOURNAMENT";
+
+  gameState.tournamentBracket = Object.keys(gameState.players).sort(
+    () => Math.random() - 0.5,
+  );
+
+  gameState.tournament = {
+    matchNumber: 0,
+    players: {},
+  };
+
+  for (const id in gameState.players) {
+    gameState.tournament.players[id] = {
+      name: gameState.players[id].name,
+      status: "Active",
+    };
+  }
+
+  startNextTournamentMatch();
+}
+
+function startNextTournamentMatch() {
+  if (gameState.tournamentBracket.length <= 1) {
+    gameState.status = "CELEBRATION";
+    gameState.intermissionTimer = 10.0;
+
+    if (gameState.tournamentBracket.length === 1) {
+      const winnerId = gameState.tournamentBracket[0];
+      gameState.winner = {
+        id: winnerId,
+        color: gameState.players[winnerId].color,
+        name: gameState.players[winnerId].name,
+      };
+      if (gameState.tournament && gameState.tournament.players[winnerId]) {
+        gameState.tournament.players[winnerId].status = "Champion";
+      }
+    }
+    return;
+  }
+
+  // [CRITICAL FIX] We MUST tell the game it is out of intermission and back in a match!
+  gameState.status = "TOURNAMENT";
+
+  gameState.tournament.matchNumber++;
+  const p1 = gameState.tournamentBracket.shift();
+  const p2 = gameState.tournamentBracket.shift();
+  gameState.activeFighters = [p1, p2];
+
+  gameState.projectiles = {};
+  gameState.turrets = {};
+  gameState.boosters = {};
+  gameState.walls = generateRandomMap();
+  scheduleBooster();
+
+  for (const id in gameState.players) {
+    const p = gameState.players[id];
+    if (id === p1 || id === p2) {
+      p.isSpectator = false;
+      p.health = 100;
+      p.score = 0;
+      p.turretScore = 0;
+      p.boostTimer = 0;
+      const pos = getValidSpawnPoint();
+      p.x = pos.x;
+      p.y = pos.y;
+    } else {
+      p.isSpectator = true;
+    }
+  }
+}
+
 wss.on("connection", (ws) => {
-  let playerId = null; // Track this specific WebSocket's player ID
+  let playerId = null;
 
   ws.on("message", (message) => {
     const data = JSON.parse(message);
 
-    // 1. Handle the Session Handshake
     if (data.type === "JOIN") {
       playerId = data.id;
+      ws.playerId = playerId;
 
       if (!gameState.players[playerId]) {
-        // Enforce the 8-player maximum limit
         if (Object.keys(gameState.players).length >= 8) {
-          // Make sure this is 8, not 3!
-          console.log(`Connection rejected: Lobby is full.`);
           ws.send(JSON.stringify({ type: "LOBBY_FULL" }));
           ws.close();
           return;
         }
 
-        // Check if this player recently disconnected
         if (recentDisconnects[playerId]) {
-          console.log(`Player ${playerId} reconnected. Restoring state.`);
-          // Restore their old position, health, and score
           gameState.players[playerId] = recentDisconnects[playerId].state;
           gameState.players[playerId].input = {
             w: false,
@@ -168,11 +278,23 @@ wss.on("connection", (ws) => {
             d: false,
           };
 
-          // Clear their deletion timer so they aren't erased
+          if (gameState.currentMode === "TOURNAMENT") {
+            gameState.players[playerId].isSpectator = true;
+          }
+
           clearTimeout(recentDisconnects[playerId].timeout);
           delete recentDisconnects[playerId];
         } else {
-          // Brand new player - spawn randomly
+          if (
+            gameState.status !== "VOTING" &&
+            gameState.status !== "CELEBRATION" &&
+            gameState.status !== "WAITING"
+          ) {
+            ws.send(JSON.stringify({ type: "MATCH_IN_PROGRESS" }));
+            ws.close();
+            return;
+          }
+
           const spawnPos = getValidSpawnPoint();
           gameState.players[playerId] = {
             x: spawnPos.x,
@@ -180,33 +302,42 @@ wss.on("connection", (ws) => {
             size: 20,
             speed: 200,
             color: data.color,
-            name: data.name || "UNKNOWN", // NEW: Save the player's name
+            name: data.name || "UNKNOWN",
             input: { w: false, a: false, s: false, d: false },
             health: 100,
             score: 0,
+            turretScore: 0,
             boostTimer: 0,
             connected: true,
+            isSpectator: false,
           };
         }
       }
-
       ws.send(JSON.stringify({ type: "INIT", id: playerId }));
       return;
     }
 
-    if (gameState.status !== "PLAYING" || !playerId) return;
+    if (!playerId || !gameState.players[playerId]) return;
 
-    const player = gameState.players[playerId];
-    if (!player) return;
+    if (data.type === "VOTE" && gameState.status === "VOTING") {
+      if (gameState.votedPlayers[playerId]) return;
 
-    // 2. Handle standard inputs using the stored playerId
+      if (data.choice === "FFA") gameState.votes.ffa++;
+      else if (data.choice === "TOURNAMENT") gameState.votes.tourney++;
+
+      gameState.votedPlayers[playerId] = data.choice;
+      return;
+    }
+
+    if (gameState.players[playerId].isSpectator) return;
+
     if (data.type === "INPUT") {
-      player.input = data.keys;
+      gameState.players[playerId].input = data.keys;
     } else if (data.type === "SHOOT") {
+      const player = gameState.players[playerId];
       const dx = data.targetX - player.x;
       const dy = data.targetY - player.y;
       const angle = Math.atan2(dy, dx);
-
       const anglesToShoot =
         player.boostTimer > 0 ? [angle - 0.2, angle, angle + 0.2] : [angle];
 
@@ -221,34 +352,31 @@ wss.on("connection", (ws) => {
         };
       }
     } else if (data.type === "DROP_TURRET") {
-      // Must have achieved 3 kills to unlock the turret
-      if (player.score >= TURRET_COST) {
-        // Prevent infinite spam: Check if they ALREADY have a turret on the map
+      const player = gameState.players[playerId];
+
+      const requiredKills =
+        gameState.currentMode === "TOURNAMENT" ? 1 : TURRET_COST;
+
+      if (player.turretScore >= requiredKills) {
         let hasActiveTurret = false;
         for (let tId in gameState.turrets) {
-          if (gameState.turrets[tId].ownerId === playerId) {
+          if (gameState.turrets[tId].ownerId === playerId)
             hasActiveTurret = true;
-            break;
-          }
         }
-
-        // Only place it if they don't have one active
         if (!hasActiveTurret) {
+          player.turretScore -= requiredKills;
+
           const turretId = Math.random().toString(36).substr(2, 9);
           gameState.turrets[turretId] = {
             x: player.x,
             y: player.y,
             ownerId: playerId,
             color: player.color,
-
-            // CHANGED: Reduced from 250 down to 125 for better arena balance
             range: 125,
-
             fireRate: 0.5,
             cooldown: 0,
             lifeSpan: 15.0,
           };
-          // SCORE IS NO LONGER SUBTRACTED HERE
         }
       }
     }
@@ -256,49 +384,98 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     if (playerId && gameState.players[playerId]) {
-      // 1. Copy their exact current state (position, health, etc.)
       const savedState = { ...gameState.players[playerId] };
-
-      // 2. Start a 60-second timer. If they don't return, permanently delete them.
       const timeout = setTimeout(() => {
         delete recentDisconnects[playerId];
-
-        // Clean up their turrets ONLY when they are permanently gone
         for (let tId in gameState.turrets) {
-          if (gameState.turrets[tId].ownerId === playerId) {
+          if (gameState.turrets[tId].ownerId === playerId)
             delete gameState.turrets[tId];
-          }
         }
-        console.log(`Player ${playerId} memory wiped after 60 seconds.`);
-      }, 60000); // 60,000 milliseconds = 60 seconds
+      }, 60000);
 
-      // 3. Save the state and the timer into our temporary cache
-      recentDisconnects[playerId] = {
-        state: savedState,
-        timeout: timeout,
-      };
-
-      // 4. Delete from the active game to immediately free up the lobby slot!
+      recentDisconnects[playerId] = { state: savedState, timeout: timeout };
       delete gameState.players[playerId];
-      console.log(
-        `Player ${playerId} disconnected. State saved for 60s. Slot freed.`,
-      );
+
+      if (gameState.votedPlayers[playerId]) {
+        if (gameState.votedPlayers[playerId] === "FFA") gameState.votes.ffa--;
+        if (gameState.votedPlayers[playerId] === "TOURNAMENT")
+          gameState.votes.tourney--;
+        delete gameState.votedPlayers[playerId];
+      }
     }
   });
 });
 
 setInterval(() => {
   const dt = 1 / TICK_RATE;
+  const numPlayers = Object.keys(gameState.players).length;
 
-  if (gameState.status === "INTERMISSION") {
+  if (numPlayers < 2 && gameState.status !== "WAITING") {
+    startWaitingPhase();
+    return;
+  } else if (numPlayers >= 2 && gameState.status === "WAITING") {
+    startVotingPhase();
+    return;
+  }
+
+  if (gameState.status === "VOTING") {
+    gameState.voteTimer -= dt;
+    if (gameState.voteTimer <= 0) {
+      resolveVotingPhase();
+    }
+  } else if (gameState.status === "INTERMISSION") {
     gameState.intermissionTimer -= dt;
     if (gameState.intermissionTimer <= 0) {
-      resetMatch();
+      if (gameState.currentMode === "TOURNAMENT") {
+        startNextTournamentMatch();
+      } else {
+        startVotingPhase();
+      }
     }
-  } else if (gameState.status === "PLAYING") {
-    // 1. Move Players
+  } else if (gameState.status === "CELEBRATION") {
+    gameState.intermissionTimer -= dt;
+    if (gameState.intermissionTimer <= 0) {
+      startVotingPhase();
+    }
+  } else if (gameState.status === "FFA" || gameState.status === "TOURNAMENT") {
+    if (
+      gameState.status === "TOURNAMENT" &&
+      gameState.activeFighters.length === 2
+    ) {
+      const [p1, p2] = gameState.activeFighters;
+      const p1Exists = !!gameState.players[p1];
+      const p2Exists = !!gameState.players[p2];
+
+      if (!p1Exists || !p2Exists) {
+        gameState.status = "INTERMISSION";
+        gameState.intermissionTimer = 5.0;
+
+        if (p1Exists) {
+          gameState.tournamentBracket.push(p1);
+          gameState.winner = {
+            name: `${gameState.players[p1].name} wins Match #${gameState.tournament.matchNumber} by forfeit!`,
+          };
+        }
+        if (p2Exists) {
+          gameState.tournamentBracket.push(p2);
+          gameState.winner = {
+            name: `${gameState.players[p2].name} wins Match #${gameState.tournament.matchNumber} by forfeit!`,
+          };
+        }
+
+        if (!p1Exists && gameState.tournament.players[p1])
+          gameState.tournament.players[p1].status = "Eliminated";
+        if (!p2Exists && gameState.tournament.players[p2])
+          gameState.tournament.players[p2].status = "Eliminated";
+
+        gameState.activeFighters = [];
+        return;
+      }
+    }
+
     for (const id in gameState.players) {
       const player = gameState.players[id];
+      if (player.isSpectator) continue;
 
       if (player.boostTimer > 0) {
         player.boostTimer -= dt;
@@ -317,13 +494,12 @@ setInterval(() => {
         dx /= length;
         dy /= length;
       }
+
       const halfSize = player.size / 2;
       const currentSpeed =
         player.boostTimer > 0 ? player.speed * 1.5 : player.speed;
-
       const eps = 0.1;
 
-      // X Movement & Collision
       player.x += dx * currentSpeed * dt;
       for (const wall of gameState.walls) {
         if (
@@ -337,7 +513,6 @@ setInterval(() => {
         }
       }
 
-      // Y Movement & Collision
       player.y += dy * currentSpeed * dt;
       for (const wall of gameState.walls) {
         if (
@@ -356,24 +531,19 @@ setInterval(() => {
       if (player.y - halfSize < 0) player.y = halfSize;
       if (player.y + halfSize > 600) player.y = 600 - halfSize;
 
-      // Check Booster Pickups
       for (const bId in gameState.boosters) {
         const booster = gameState.boosters[bId];
         const dist = Math.sqrt(
           (player.x - booster.x) ** 2 + (player.y - booster.y) ** 2,
         );
-
         if (dist < player.size / 2 + booster.size / 2) {
           player.boostTimer = 10.0;
           delete gameState.boosters[bId];
-
-          // NEW: Restart the spawn cycle immediately upon collection
           scheduleBooster();
         }
       }
     }
 
-    // 2. Turret Logic
     for (const tId in gameState.turrets) {
       const turret = gameState.turrets[tId];
       turret.lifeSpan -= dt;
@@ -386,7 +556,9 @@ setInterval(() => {
         let closestEnemy = null;
         let minDistance = turret.range;
         for (const pId in gameState.players) {
-          if (pId === turret.ownerId) continue;
+          if (pId === turret.ownerId || gameState.players[pId].isSpectator)
+            continue;
+
           const enemy = gameState.players[pId];
           const distX = enemy.x - turret.x;
           const distY = enemy.y - turret.y;
@@ -413,7 +585,6 @@ setInterval(() => {
       }
     }
 
-    // 3. Projectiles & Hit Registration
     for (const pId in gameState.projectiles) {
       const bullet = gameState.projectiles[pId];
       bullet.x += bullet.vx * dt;
@@ -443,7 +614,12 @@ setInterval(() => {
       }
 
       for (const playerId in gameState.players) {
-        if (playerId === bullet.ownerId) continue;
+        if (
+          playerId === bullet.ownerId ||
+          gameState.players[playerId].isSpectator
+        )
+          continue;
+
         const target = gameState.players[playerId];
         const halfSize = target.size / 2;
 
@@ -460,13 +636,34 @@ setInterval(() => {
             if (gameState.players[bullet.ownerId]) {
               const attacker = gameState.players[bullet.ownerId];
               attacker.score += 1;
+              attacker.turretScore += 1;
 
-              if (attacker.score >= WIN_SCORE) {
+              if (
+                gameState.currentMode === "FFA" &&
+                attacker.score >= FFA_WIN_SCORE &&
+                gameState.status === "FFA"
+              ) {
                 gameState.status = "INTERMISSION";
                 gameState.intermissionTimer = 5.0;
                 gameState.winner = {
                   id: bullet.ownerId,
                   color: attacker.color,
+                  name: attacker.name,
+                };
+              } else if (
+                gameState.currentMode === "TOURNAMENT" &&
+                attacker.score >= TOURNAMENT_WIN_SCORE &&
+                gameState.status === "TOURNAMENT"
+              ) {
+                gameState.status = "INTERMISSION";
+                gameState.intermissionTimer = 5.0;
+                gameState.tournamentBracket.push(bullet.ownerId);
+                gameState.activeFighters = [];
+
+                gameState.tournament.players[bullet.ownerId].status = "Active";
+                gameState.tournament.players[playerId].status = "Eliminated";
+                gameState.winner = {
+                  name: `${attacker.name} wins Match #${gameState.tournament.matchNumber}!`,
                 };
               }
             }
@@ -476,6 +673,7 @@ setInterval(() => {
             target.y = respawnPos.y;
             target.health = 100;
             target.score = 0;
+            target.turretScore = 0;
             target.boostTimer = 0;
           }
           break;
