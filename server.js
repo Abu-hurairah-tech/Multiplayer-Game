@@ -39,7 +39,7 @@ const gameState = {
 };
 
 const recentDisconnects = {};
-const activeSockets = {}; // [NEW] Tracks which tab is currently controlling the player
+const activeSockets = {}; // Tracks which tab is currently controlling the player
 let projectileIdCounter = 0;
 let boosterIdCounter = 0;
 let boosterSpawnTimer = null;
@@ -222,9 +222,7 @@ function startNextTournamentMatch() {
     return;
   }
 
-  // [CRITICAL FIX] We MUST tell the game it is out of intermission and back in a match!
   gameState.status = "TOURNAMENT";
-
   gameState.tournament.matchNumber++;
   const p1 = gameState.tournamentBracket.shift();
   const p2 = gameState.tournamentBracket.shift();
@@ -254,16 +252,50 @@ function startNextTournamentMatch() {
 }
 
 wss.on("connection", (ws) => {
-  let playerId = null;
+  let playerId = null; // Local scope variable
 
   ws.on("message", (message) => {
     const data = JSON.parse(message);
 
-    if (data.type === "JOIN") {
-      playerId = data.id;
-      ws.playerId = playerId;
+    // 1. HARD QUIT LOGIC (Properly separated from JOIN)
+    if (data.type === "QUIT") {
+      const targetId = data.id || playerId;
 
-      // [NEW] If this player is already playing in another tab, kick the old tab!
+      if (targetId && gameState.players[targetId]) {
+        if (activeSockets[targetId] === ws) delete activeSockets[targetId];
+
+        delete gameState.players[targetId]; // WIPE IMMEDIATELY
+
+        for (let tId in gameState.turrets) {
+          if (gameState.turrets[tId].ownerId === targetId)
+            delete gameState.turrets[tId];
+        }
+
+        if (gameState.votedPlayers[targetId]) {
+          if (gameState.votedPlayers[targetId] === "FFA") gameState.votes.ffa--;
+          if (gameState.votedPlayers[targetId] === "TOURNAMENT")
+            gameState.votes.tourney--;
+          delete gameState.votedPlayers[targetId];
+        }
+
+        if (recentDisconnects[targetId]) {
+          clearTimeout(recentDisconnects[targetId].timeout);
+          delete recentDisconnects[targetId];
+        }
+
+        playerId = null;
+        ws.playerId = null;
+      }
+      return;
+    }
+
+    // 2. JOIN LOGIC
+    if (data.type === "JOIN") {
+      // Sync both the local scope and the socket scope immediately
+      playerId = data.id;
+      ws.playerId = data.id;
+
+      // Kick old tabs
       if (activeSockets[playerId] && activeSockets[playerId] !== ws) {
         try {
           activeSockets[playerId].send(
@@ -275,7 +307,7 @@ wss.on("connection", (ws) => {
           activeSockets[playerId].close();
         } catch (e) {}
       }
-      activeSockets[playerId] = ws; // Assign the current tab as the active one
+      activeSockets[playerId] = ws;
 
       if (!gameState.players[playerId]) {
         if (Object.keys(gameState.players).length >= 8) {
@@ -292,6 +324,10 @@ wss.on("connection", (ws) => {
             s: false,
             d: false,
           };
+          gameState.players[playerId].name =
+            data.name || gameState.players[playerId].name;
+          gameState.players[playerId].color =
+            data.color || gameState.players[playerId].color;
 
           if (gameState.currentMode === "TOURNAMENT") {
             gameState.players[playerId].isSpectator = true;
@@ -312,6 +348,7 @@ wss.on("connection", (ws) => {
 
           const spawnPos = getValidSpawnPoint();
           gameState.players[playerId] = {
+            id: playerId, // Ensure the internal ID matches
             x: spawnPos.x,
             y: spawnPos.y,
             size: 20,
@@ -328,7 +365,7 @@ wss.on("connection", (ws) => {
           };
         }
       } else {
-        // [NEW] If the player already exists (tab takeover), just update their name/color
+        // Tab takeover - update UI aesthetics
         gameState.players[playerId].name =
           data.name || gameState.players[playerId].name;
         gameState.players[playerId].color =
@@ -341,18 +378,18 @@ wss.on("connection", (ws) => {
 
     if (!playerId || !gameState.players[playerId]) return;
 
+    // 3. VOTING LOGIC
     if (data.type === "VOTE" && gameState.status === "VOTING") {
       if (gameState.votedPlayers[playerId]) return;
-
       if (data.choice === "FFA") gameState.votes.ffa++;
       else if (data.choice === "TOURNAMENT") gameState.votes.tourney++;
-
       gameState.votedPlayers[playerId] = data.choice;
       return;
     }
 
     if (gameState.players[playerId].isSpectator) return;
 
+    // 4. GAMEPLAY INPUTS
     if (data.type === "INPUT") {
       gameState.players[playerId].input = data.keys;
     } else if (data.type === "SHOOT") {
@@ -375,7 +412,6 @@ wss.on("connection", (ws) => {
       }
     } else if (data.type === "DROP_TURRET") {
       const player = gameState.players[playerId];
-
       const requiredKills =
         gameState.currentMode === "TOURNAMENT" ? 1 : TURRET_COST;
 
@@ -387,7 +423,6 @@ wss.on("connection", (ws) => {
         }
         if (!hasActiveTurret) {
           player.turretScore -= requiredKills;
-
           const turretId = Math.random().toString(36).substr(2, 9);
           gameState.turrets[turretId] = {
             x: player.x,
@@ -404,30 +439,29 @@ wss.on("connection", (ws) => {
     }
   });
 
+  // [FIXED] Tab Close / Disconnect
   ws.on("close", () => {
-    // [NEW] Only trigger the disconnect sequence if the CLOSING tab is the active one
-    if (playerId && activeSockets[playerId] === ws) {
-      delete activeSockets[playerId];
+    const targetId = ws.playerId;
 
-      if (gameState.players[playerId]) {
-        const savedState = { ...gameState.players[playerId] };
-        const timeout = setTimeout(() => {
-          delete recentDisconnects[playerId];
-          for (let tId in gameState.turrets) {
-            if (gameState.turrets[tId].ownerId === playerId)
-              delete gameState.turrets[tId];
-          }
-        }, 60000);
+    if (targetId && gameState.players[targetId]) {
+      // Save for reconnect
+      recentDisconnects[targetId] = {
+        state: JSON.parse(JSON.stringify(gameState.players[targetId])),
+        timeout: setTimeout(() => {
+          delete recentDisconnects[targetId];
+        }, 60000),
+      };
 
-        recentDisconnects[playerId] = { state: savedState, timeout: timeout };
-        delete gameState.players[playerId];
+      // Delete immediately
+      delete gameState.players[targetId];
+      delete activeSockets[targetId];
 
-        if (gameState.votedPlayers[playerId]) {
-          if (gameState.votedPlayers[playerId] === "FFA") gameState.votes.ffa--;
-          if (gameState.votedPlayers[playerId] === "TOURNAMENT")
-            gameState.votes.tourney--;
-          delete gameState.votedPlayers[playerId];
-        }
+      // Clear votes
+      if (gameState.votedPlayers[targetId]) {
+        if (gameState.votedPlayers[targetId] === "FFA") gameState.votes.ffa--;
+        if (gameState.votedPlayers[targetId] === "TOURNAMENT")
+          gameState.votes.tourney--;
+        delete gameState.votedPlayers[targetId];
       }
     }
   });

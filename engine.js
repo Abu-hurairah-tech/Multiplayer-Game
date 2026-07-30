@@ -129,21 +129,24 @@ function getRandomColor() {
   }
   return color;
 }
-document.getElementById("player-color").value = getRandomColor();
 
+// 1. Ensure Player Identity is maintained across tabs
 let sessionId = localStorage.getItem("arena_session_id");
 if (!sessionId) {
   sessionId = Math.random().toString(36).substring(2, 15);
   localStorage.setItem("arena_session_id", sessionId);
 }
 
-document.getElementById("join-btn").addEventListener("click", () => {
-  if (SoundEngine.ctx.state === "suspended") {
-    SoundEngine.ctx.resume();
-  }
+// 2. Load previously saved name and color
+let savedName = localStorage.getItem("arena_name");
+let savedColor = localStorage.getItem("arena_color");
+if (savedName) document.getElementById("player-name").value = savedName;
+if (savedColor) document.getElementById("player-color").value = savedColor;
+else document.getElementById("player-color").value = getRandomColor();
 
-  const name = document.getElementById("player-name").value || "Player";
-  const color = document.getElementById("player-color").value;
+// Helper to actually send the join packet
+function attemptJoin(name, color) {
+  if (SoundEngine.ctx.state === "suspended") SoundEngine.ctx.resume();
 
   socket.send(
     JSON.stringify({
@@ -155,6 +158,98 @@ document.getElementById("join-btn").addEventListener("click", () => {
   );
 
   loginOverlay.style.display = "none";
+}
+
+// 3. Auto-Join if this is just a page refresh
+socket.onopen = () => {
+  if (sessionStorage.getItem("arena_auto_join") === "true") {
+    const name = localStorage.getItem("arena_name") || "Player";
+    const color = localStorage.getItem("arena_color") || getRandomColor();
+    attemptJoin(name, color);
+  }
+};
+
+// 4. If connection is completely lost, force them back to the login screen
+socket.onclose = () => {
+  sessionStorage.removeItem("arena_auto_join"); // Clear the auto-join flag
+  loginOverlay.style.display = "flex"; // Show name panel again
+};
+
+document.getElementById("join-btn").addEventListener("click", () => {
+  const name = document.getElementById("player-name").value || "Player";
+  const color = document.getElementById("player-color").value;
+
+  // Save to local storage for future, and flag session storage to auto-join on refresh
+  localStorage.setItem("arena_name", name);
+  localStorage.setItem("arena_color", color);
+  sessionStorage.setItem("arena_auto_join", "true");
+
+  attemptJoin(name, color);
+});
+
+// --- QUIT CONFIRMATION LOGIC ---
+const quitBtn = document.getElementById("quit-btn");
+const quitConfirm = document.getElementById("quit-confirm");
+const quitYes = document.getElementById("quit-yes");
+const quitNo = document.getElementById("quit-no");
+
+if (quitBtn) {
+  // Show confirmation
+  quitBtn.addEventListener("click", () => {
+    quitBtn.style.display = "none";
+    quitConfirm.style.display = "block";
+  });
+
+  // Cancel quit
+  quitNo.addEventListener("click", () => {
+    quitConfirm.style.display = "none";
+    quitBtn.style.display = "block";
+  });
+
+  // Confirm quit
+  quitYes.addEventListener("click", () => {
+    // 1. Tell server to wipe our data immediately (NOW PASSING ID)
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "QUIT", id: sessionId }));
+    }
+
+    // 2. Stop the game from auto-joining on refresh
+    sessionStorage.removeItem("arena_auto_join");
+
+    // 3. Generate a completely fresh Session ID locally
+    sessionId = Math.random().toString(36).substring(2, 15);
+    localStorage.setItem("arena_session_id", sessionId);
+
+    // 4. Wipe local tracking variables
+    myId = null;
+    gameState = null;
+    oldState = null;
+
+    // 5. CLEAR THE CANVAS to remove the "ghost" frozen frame
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 6. Reset UI layout back to login
+    quitConfirm.style.display = "none";
+    quitBtn.style.display = "block"; // Reset for next time
+
+    hud.style.display = "none";
+    spectatorHud.style.display = "none";
+    messageOverlay.style.display = "none";
+    votingOverlay.style.display = "none";
+    loginOverlay.style.display = "flex";
+
+    document.getElementById("player-name").value = "";
+  });
+}
+
+// Since Auto-Join bypasses the Join button, we must unlock audio on the first click/keypress
+window.addEventListener("mousedown", () => {
+  if (SoundEngine.ctx.state === "suspended") SoundEngine.ctx.resume();
+});
+window.addEventListener("keydown", () => {
+  if (SoundEngine.ctx.state === "suspended") SoundEngine.ctx.resume();
 });
 
 socket.onmessage = (event) => {
@@ -167,6 +262,8 @@ socket.onmessage = (event) => {
     data.type === "MATCH_IN_PROGRESS" ||
     data.type === "LOBBY_FULL"
   ) {
+    sessionStorage.removeItem("arena_auto_join"); // Don't auto-join if they were kicked
+    loginOverlay.style.display = "flex";
     showMessage(
       data.type.replace(/_/g, " "),
       data.reason || "Please try again later.",
@@ -174,6 +271,9 @@ socket.onmessage = (event) => {
   } else if (data.type === "STATE_UPDATE") {
     gameState = data.state;
 
+    if (!myId) return;
+
+    gameState = data.state;
     // --- DEATH, DAMAGE, AND EXPLOSION DETECTION ---
     if (oldState) {
       for (let pId in gameState.players) {
@@ -181,21 +281,17 @@ socket.onmessage = (event) => {
         const pNew = gameState.players[pId];
 
         if (pOld && pNew) {
-          // Check if player teleports instantly (FFA Respawn)
           const dist = Math.sqrt(
             Math.pow(pNew.x - pOld.x, 2) + Math.pow(pNew.y - pOld.y, 2),
           );
 
-          // IF they died in tournament OR they died and respawned in FFA
           if (
             (!pOld.isSpectator && pNew.isSpectator) ||
             (dist > 50 && !pNew.isSpectator)
           ) {
             createExplosion(pOld.x, pOld.y, pOld.color);
             SoundEngine.kill();
-          }
-          // Normal Damage hit
-          else if (pNew.health < pOld.health) {
+          } else if (pNew.health < pOld.health) {
             SoundEngine.hit();
           }
         }
