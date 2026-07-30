@@ -11,8 +11,115 @@ const hud = document.getElementById("hud");
 
 let myId = null;
 let gameState = null;
+let oldState = null;
 let renderPlayers = {};
 let keys = { w: false, a: false, s: false, d: false };
+
+// --- [NEW] VISUAL PARTICLE SYSTEM ---
+let particles = [];
+
+function createExplosion(x, y, color) {
+  for (let i = 0; i < 30; i++) {
+    particles.push({
+      x: x,
+      y: y,
+      vx: (Math.random() - 0.5) * 400, // Explode outward in random directions
+      vy: (Math.random() - 0.5) * 400,
+      life: 1.0,
+      color: color,
+      size: Math.random() * 6 + 2, // Different sized shards
+    });
+  }
+}
+
+// --- 1. THE SOUND SYNTHESIZER ---
+const SoundEngine = {
+  ctx: new (window.AudioContext || window.webkitAudioContext)(),
+
+  shoot: function () {
+    if (this.ctx.state === "suspended") return;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(800, this.ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(100, this.ctx.currentTime + 0.1);
+    gain.gain.setValueAtTime(0.05, this.ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 0.1);
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    osc.start();
+    osc.stop(this.ctx.currentTime + 0.1);
+  },
+
+  hit: function () {
+    if (this.ctx.state === "suspended") return;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(150, this.ctx.currentTime);
+    gain.gain.setValueAtTime(0.1, this.ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.2);
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    osc.start();
+    osc.stop(this.ctx.currentTime + 0.2);
+  },
+
+  // [NEW] Retro explosion drop sound
+  kill: function () {
+    if (this.ctx.state === "suspended") return;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(100, this.ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(10, this.ctx.currentTime + 0.4);
+    gain.gain.setValueAtTime(0.25, this.ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.4);
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    osc.start();
+    osc.stop(this.ctx.currentTime + 0.4);
+  },
+
+  turret: function () {
+    if (this.ctx.state === "suspended") return;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(1200, this.ctx.currentTime);
+    gain.gain.setValueAtTime(0.1, this.ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 0.1);
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    osc.start();
+    osc.stop(this.ctx.currentTime + 0.1);
+  },
+
+  win: function () {
+    if (this.ctx.state === "suspended") return;
+    const playTone = (freq, delay) => {
+      setTimeout(() => {
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.1, this.ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(
+          0.01,
+          this.ctx.currentTime + 0.3,
+        );
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start();
+        osc.stop(this.ctx.currentTime + 0.3);
+      }, delay);
+    };
+    playTone(440, 0);
+    playTone(554, 150);
+    playTone(659, 300);
+    playTone(880, 450);
+  },
+};
 
 function getRandomColor() {
   const letters = "0123456789ABCDEF";
@@ -24,13 +131,17 @@ function getRandomColor() {
 }
 document.getElementById("player-color").value = getRandomColor();
 
-let sessionId = sessionStorage.getItem("arena_session_id");
+let sessionId = localStorage.getItem("arena_session_id");
 if (!sessionId) {
   sessionId = Math.random().toString(36).substring(2, 15);
-  sessionStorage.setItem("arena_session_id", sessionId);
+  localStorage.setItem("arena_session_id", sessionId);
 }
 
 document.getElementById("join-btn").addEventListener("click", () => {
+  if (SoundEngine.ctx.state === "suspended") {
+    SoundEngine.ctx.resume();
+  }
+
   const name = document.getElementById("player-name").value || "Player";
   const color = document.getElementById("player-color").value;
 
@@ -62,6 +173,42 @@ socket.onmessage = (event) => {
     );
   } else if (data.type === "STATE_UPDATE") {
     gameState = data.state;
+
+    // --- DEATH, DAMAGE, AND EXPLOSION DETECTION ---
+    if (oldState) {
+      for (let pId in gameState.players) {
+        const pOld = oldState.players[pId];
+        const pNew = gameState.players[pId];
+
+        if (pOld && pNew) {
+          // Check if player teleports instantly (FFA Respawn)
+          const dist = Math.sqrt(
+            Math.pow(pNew.x - pOld.x, 2) + Math.pow(pNew.y - pOld.y, 2),
+          );
+
+          // IF they died in tournament OR they died and respawned in FFA
+          if (
+            (!pOld.isSpectator && pNew.isSpectator) ||
+            (dist > 50 && !pNew.isSpectator)
+          ) {
+            createExplosion(pOld.x, pOld.y, pOld.color);
+            SoundEngine.kill();
+          }
+          // Normal Damage hit
+          else if (pNew.health < pOld.health) {
+            SoundEngine.hit();
+          }
+        }
+      }
+      if (
+        oldState.status !== "CELEBRATION" &&
+        gameState.status === "CELEBRATION"
+      ) {
+        SoundEngine.win();
+      }
+    }
+
+    oldState = JSON.parse(JSON.stringify(gameState));
     updateUI(gameState);
   }
 };
@@ -133,13 +280,11 @@ function updateUI(state) {
       if (activeTurret)
         turretText = "<span style='color: #ff9800;'>DEPLOYED ACTIVE</span>";
 
-      // --- BUILD THE NEW TOURNAMENT LEADERBOARD ---
       let tourneyStats = "";
       if (state.currentMode === "TOURNAMENT" && state.tournament) {
         tourneyStats = `<div style="margin-top: 15px; padding-top: 10px; border-top: 1px solid #555;">`;
         tourneyStats += `<div style="margin-bottom: 8px; color: #ffeb3b;"><strong>Tournament Standings</strong></div>`;
 
-        // Sort players logically: Champions first, then Active, then Eliminated
         const playersList = Object.values(state.tournament.players).sort(
           (a, b) => {
             const ranks = { Champion: 1, Active: 2, Eliminated: 3 };
@@ -216,6 +361,7 @@ window.addEventListener("keydown", (e) => {
   if (e.code === "Space") {
     e.preventDefault();
     socket.send(JSON.stringify({ type: "DROP_TURRET" }));
+    SoundEngine.turret();
   }
 });
 
@@ -258,6 +404,7 @@ canvas.addEventListener("mousedown", (e) => {
   const targetY = (e.clientY - rect.top) * scaleY;
 
   socket.send(JSON.stringify({ type: "SHOOT", targetX, targetY }));
+  SoundEngine.shoot();
 });
 
 const lerp = (start, end, factor) => start + (end - start) * factor;
@@ -331,6 +478,23 @@ function drawGame(state) {
     ctx.arc(bullet.x, bullet.y, 4, 0, Math.PI * 2);
     ctx.fill();
   }
+
+  // --- [NEW] DRAW AND UPDATE PARTICLES ---
+  for (let i = particles.length - 1; i >= 0; i--) {
+    let p = particles[i];
+    p.x += p.vx * 0.016; // Simulate movement based on 60fps
+    p.y += p.vy * 0.016;
+    p.life -= 0.025; // Fade out over time
+
+    if (p.life <= 0) {
+      particles.splice(i, 1);
+    } else {
+      ctx.globalAlpha = p.life;
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    }
+  }
+  ctx.globalAlpha = 1.0;
 }
 
 function gameLoop() {

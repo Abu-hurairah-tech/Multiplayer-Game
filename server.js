@@ -39,6 +39,7 @@ const gameState = {
 };
 
 const recentDisconnects = {};
+const activeSockets = {}; // [NEW] Tracks which tab is currently controlling the player
 let projectileIdCounter = 0;
 let boosterIdCounter = 0;
 let boosterSpawnTimer = null;
@@ -262,6 +263,20 @@ wss.on("connection", (ws) => {
       playerId = data.id;
       ws.playerId = playerId;
 
+      // [NEW] If this player is already playing in another tab, kick the old tab!
+      if (activeSockets[playerId] && activeSockets[playerId] !== ws) {
+        try {
+          activeSockets[playerId].send(
+            JSON.stringify({
+              type: "KICKED",
+              reason: "Game opened in another tab",
+            }),
+          );
+          activeSockets[playerId].close();
+        } catch (e) {}
+      }
+      activeSockets[playerId] = ws; // Assign the current tab as the active one
+
       if (!gameState.players[playerId]) {
         if (Object.keys(gameState.players).length >= 8) {
           ws.send(JSON.stringify({ type: "LOBBY_FULL" }));
@@ -312,7 +327,14 @@ wss.on("connection", (ws) => {
             isSpectator: false,
           };
         }
+      } else {
+        // [NEW] If the player already exists (tab takeover), just update their name/color
+        gameState.players[playerId].name =
+          data.name || gameState.players[playerId].name;
+        gameState.players[playerId].color =
+          data.color || gameState.players[playerId].color;
       }
+
       ws.send(JSON.stringify({ type: "INIT", id: playerId }));
       return;
     }
@@ -383,24 +405,29 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (playerId && gameState.players[playerId]) {
-      const savedState = { ...gameState.players[playerId] };
-      const timeout = setTimeout(() => {
-        delete recentDisconnects[playerId];
-        for (let tId in gameState.turrets) {
-          if (gameState.turrets[tId].ownerId === playerId)
-            delete gameState.turrets[tId];
+    // [NEW] Only trigger the disconnect sequence if the CLOSING tab is the active one
+    if (playerId && activeSockets[playerId] === ws) {
+      delete activeSockets[playerId];
+
+      if (gameState.players[playerId]) {
+        const savedState = { ...gameState.players[playerId] };
+        const timeout = setTimeout(() => {
+          delete recentDisconnects[playerId];
+          for (let tId in gameState.turrets) {
+            if (gameState.turrets[tId].ownerId === playerId)
+              delete gameState.turrets[tId];
+          }
+        }, 60000);
+
+        recentDisconnects[playerId] = { state: savedState, timeout: timeout };
+        delete gameState.players[playerId];
+
+        if (gameState.votedPlayers[playerId]) {
+          if (gameState.votedPlayers[playerId] === "FFA") gameState.votes.ffa--;
+          if (gameState.votedPlayers[playerId] === "TOURNAMENT")
+            gameState.votes.tourney--;
+          delete gameState.votedPlayers[playerId];
         }
-      }, 60000);
-
-      recentDisconnects[playerId] = { state: savedState, timeout: timeout };
-      delete gameState.players[playerId];
-
-      if (gameState.votedPlayers[playerId]) {
-        if (gameState.votedPlayers[playerId] === "FFA") gameState.votes.ffa--;
-        if (gameState.votedPlayers[playerId] === "TOURNAMENT")
-          gameState.votes.tourney--;
-        delete gameState.votedPlayers[playerId];
       }
     }
   });
