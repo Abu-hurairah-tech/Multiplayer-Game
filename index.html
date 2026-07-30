@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Multiplayer Arena Shooter</title>
+    <style>
+      /* 1. Reset all default browser margins and padding */
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      /* 2. Lock the body to the exact screen size and kill scrollbars */
+      body {
+        margin: 0;
+        overflow: hidden;
+        background-color: #222;
+        font-family: monospace, sans-serif;
+        color: white;
+      }
+
+      /* 3. Global Overlay Class for Game States */
+      .overlay {
+        display: none;
+        position: absolute;
+        inset: 0;
+        background-color: rgba(0, 0, 0, 0.95);
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        z-index: 150; /* Base overlay level */
+      }
+
+      /* 4. Voting Cards System */
+      .vote-card {
+        background-color: #222;
+        border: 2px solid white;
+        padding: 40px;
+        cursor: pointer;
+        text-align: center;
+        width: 40%;
+        border-radius: 10px;
+        transition:
+          background 0.2s,
+          border-color 0.2s;
+      }
+      .vote-card:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
+      .vote-card.selected {
+        background: rgba(76, 175, 80, 0.3);
+        border-color: #4caf50;
+      }
+
+      /* 5. In-Game HUD Elements */
+      #hud {
+        position: absolute;
+        top: 15px;
+        left: 15px;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 10px 15px;
+        border-radius: 6px;
+        z-index: 10;
+        pointer-events: none;
+        font-size: 16px;
+        font-weight: bold;
+        line-height: 1.5;
+      }
+
+      #spectator-hud {
+        display: none;
+        position: absolute;
+        top: 15px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: #ff4c4c;
+        font-size: 28px;
+        font-weight: bold;
+        z-index: 10;
+        pointer-events: none;
+        text-shadow: 0 0 10px rgba(255, 76, 76, 0.5);
+        letter-spacing: 2px;
+      }
+
+      /* 6. Center the game canvas perfectly in the window */
+      #canvas-container {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        width: 100vw;
+        height: 100vh;
+      }
+
+      /* 7. Make the canvas responsive so it never exceeds the screen */
+      canvas {
+        background-color: #111;
+        border: 4px solid #444;
+        border-radius: 8px;
+        box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+        max-width: 95vw;
+        max-height: 85vh;
+        object-fit: contain;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Login / Name Entry Overlay (Matches engine.js IDs exactly) -->
+    <div id="login-overlay" class="overlay" style="display: flex; z-index: 200">
+      <h1 style="color: white; margin-bottom: 20px; font-family: monospace">
+        ENTER ARENA
+      </h1>
+      <input
+        type="text"
+        id="player-name"
+        maxlength="12"
+        autocomplete="off"
+        style="
+          padding: 12px;
+          font-size: 20px;
+          text-align: center;
+          font-family: monospace;
+          border: 2px solid #555;
+          background: #222;
+          color: white;
+          border-radius: 6px;
+          outline: none;
+          text-transform: uppercase;
+          margin-bottom: 15px;
+        "
+        placeholder="PLAYER NAME"
+      />
+
+      <!-- Color Picker added so the engine.js doesn't crash -->
+      <div
+        style="
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          margin-bottom: 20px;
+        "
+      >
+        <label for="player-color" style="font-size: 16px">Color:</label>
+        <input
+          type="color"
+          id="player-color"
+          value="#4caf50"
+          style="
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            height: 40px;
+            width: 40px;
+          "
+        />
+      </div>
+
+      <div
+        id="name-error"
+        style="
+          color: #ff4c4c;
+          font-size: 14px;
+          margin-bottom: 10px;
+          opacity: 0;
+          transition: opacity 0.2s;
+        "
+      >
+        Name cannot be empty!
+      </div>
+
+      <button
+        id="join-btn"
+        style="
+          padding: 12px 40px;
+          font-size: 18px;
+          font-family: monospace;
+          font-weight: bold;
+          background: #4caf50;
+          color: white;
+          border: none;
+          border-radius: 6px;
+          cursor: pointer;
+        "
+      >
+        JOIN ARENA
+      </button>
+    </div>
+
+    <!-- Voting Overlay -->
+    <div id="voting-overlay" class="overlay">
+      <h2 style="font-size: 2rem; margin-bottom: 10px">
+        Next Match Starts In:
+        <span id="vote-timer" style="color: #ff4c4c">15</span>
+      </h2>
+
+      <div
+        style="
+          display: flex;
+          width: 80%;
+          max-width: 600px;
+          justify-content: space-around;
+          margin-top: 20px;
+          gap: 20px;
+        "
+      >
+        <div id="vote-ffa" class="vote-card">
+          <h3 style="margin-bottom: 15px; font-size: 1.5rem">Free For All</h3>
+          <p style="font-size: 1.2rem; color: #aaa">
+            Votes: <span id="ffa-count" style="color: white">0</span>
+          </p>
+        </div>
+        <div id="vote-tourney" class="vote-card">
+          <h3 style="margin-bottom: 15px; font-size: 1.5rem">Tournament</h3>
+          <p style="font-size: 1.2rem; color: #aaa">
+            Votes: <span id="tourney-count" style="color: white">0</span>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Message / Intermission Overlay -->
+    <div id="message-overlay" class="overlay" style="z-index: 160">
+      <h1
+        id="message-title"
+        style="
+          font-size: 3rem;
+          margin-bottom: 15px;
+          text-shadow: 0 0 15px rgba(255, 255, 255, 0.5);
+        "
+      ></h1>
+      <h3 id="message-subtitle" style="font-size: 1.5rem; color: #ddd"></h3>
+    </div>
+
+    <!-- Active Gameplay HUD Elements -->
+    <div id="spectator-hud">SPECTATING</div>
+    <div id="hud"></div>
+
+    <!-- The Game Canvas Wrapper -->
+    <div id="canvas-container">
+      <canvas id="gameCanvas" width="800" height="600"></canvas>
+    </div>
+
+    <!-- Bottom Right Controls -->
+    <div
+      style="
+        position: absolute;
+        bottom: 20px;
+        right: 20px;
+        z-index: 100;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+      "
+    >
+      <!-- The main Quit button -->
+      <button
+        id="quit-btn"
+        style="
+          padding: 10px 20px;
+          font-weight: bold;
+          background: #ff4c4c;
+          color: white;
+          border: 2px solid white;
+          cursor: pointer;
+          border-radius: 5px;
+          font-family: monospace;
+          transition: background 0.2s;
+        "
+      >
+        QUIT GAME
+      </button>
+
+      <!-- The Confirmation Popup (Hidden by default) -->
+      <div
+        id="quit-confirm"
+        style="
+          display: none;
+          background: rgba(0, 0, 0, 0.9);
+          padding: 15px;
+          border: 2px solid #ff4c4c;
+          border-radius: 5px;
+          text-align: center;
+        "
+      >
+        <div
+          style="
+            margin-bottom: 15px;
+            font-weight: bold;
+            font-family: monospace;
+            font-size: 16px;
+          "
+        >
+          ARE YOU SURE?
+        </div>
+        <div style="display: flex; gap: 10px; justify-content: center">
+          <button
+            id="quit-yes"
+            style="
+              padding: 8px 20px;
+              background: #ff4c4c;
+              color: white;
+              border: 1px solid white;
+              cursor: pointer;
+              font-weight: bold;
+              font-family: monospace;
+              border-radius: 3px;
+            "
+          >
+            YES
+          </button>
+          <button
+            id="quit-no"
+            style="
+              padding: 8px 20px;
+              background: #555;
+              color: white;
+              border: 1px solid white;
+              cursor: pointer;
+              font-weight: bold;
+              font-family: monospace;
+              border-radius: 3px;
+            "
+          >
+            NO
+          </button>
+        </div>
+      </div>
+    </div>
+    <script src="engine.js"></script>
+  </body>
+</html>
