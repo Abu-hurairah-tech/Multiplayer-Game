@@ -841,8 +841,8 @@ setInterval(() => {
             target.x = respawnPos.x;
             target.y = respawnPos.y;
             target.health = 100;
-            target.score = 0;
-            target.turretScore = 0;
+            target.score = Math.max(0, target.score - 1);
+            target.turretScore = Math.max(0, target.turretScore - 1);
             target.boostTimer = 0;
           }
           break; // Stop checking other players for this bullet
